@@ -21,9 +21,7 @@ class BudgetExceeded(Exception):
         self.axis = axis
         self.attempted = attempted
         self.cap = cap
-        super().__init__(
-            f"budget exceeded on {axis}: attempted {attempted:.6g} > cap {cap:.6g}"
-        )
+        super().__init__(f"budget exceeded on {axis}: attempted {attempted:.6g} > cap {cap:.6g}")
 
 
 @dataclass(frozen=True)
@@ -68,6 +66,9 @@ class BudgetPool:
         # also count reserved-but-not-committed
         self._tokens_reserved = 0
         self._usd_reserved = 0.0
+        # bumped on reset() so reservations made before a reset become inert
+        # (committing/releasing them must not corrupt the post-reset counters)
+        self._generation = 0
         self._lock = threading.Lock()
 
     # ---- single-phase ----
@@ -94,7 +95,8 @@ class BudgetPool:
             self._check_capacity(tokens, usd)
             self._tokens_reserved += tokens
             self._usd_reserved += usd
-        return Reservation(_pool=self, _tokens=tokens, _usd=usd)
+            generation = self._generation
+        return Reservation(_pool=self, _tokens=tokens, _usd=usd, _generation=generation)
 
     @contextmanager
     def reserve(self, *, tokens: int = 0, usd: float = 0.0) -> Iterator[Reservation]:
@@ -111,14 +113,26 @@ class BudgetPool:
             if not r._completed:
                 self._release_reservation(r)
 
-    def _commit_reservation(
-        self, r: Reservation, actual_tokens: int, actual_usd: float
-    ) -> None:
+    def _commit_reservation(self, r: Reservation, actual_tokens: int, actual_usd: float) -> None:
         if r._completed:
             raise RuntimeError("reservation already committed or released")
         if actual_tokens < 0 or actual_usd < 0:
             raise ValueError("actual amounts must be non-negative")
         with self._lock:
+            if r._generation != self._generation:
+                # The pool was reset() after this reservation was made; its hold
+                # has already been dropped. Don't double-subtract the reserved
+                # counters (that would drive them negative). Still record the
+                # actual usage against the current generation, subject to caps.
+                try:
+                    self._check_capacity(actual_tokens, actual_usd)
+                except BudgetExceeded:
+                    r._completed = True
+                    raise
+                self._tokens += actual_tokens
+                self._usd += actual_usd
+                r._completed = True
+                return
             # release the reservation first
             self._tokens_reserved -= r._tokens
             self._usd_reserved -= r._usd
@@ -138,8 +152,12 @@ class BudgetPool:
         if r._completed:
             return
         with self._lock:
-            self._tokens_reserved -= r._tokens
-            self._usd_reserved -= r._usd
+            if r._generation == self._generation:
+                # Only refund if the hold is still live. After a reset() the
+                # reserved counters were already cleared, so subtracting again
+                # would drive them negative.
+                self._tokens_reserved -= r._tokens
+                self._usd_reserved -= r._usd
             r._completed = True
 
     # ---- introspection ----
@@ -164,12 +182,19 @@ class BudgetPool:
             )
 
     def reset(self) -> None:
-        """Zero both axes. Drops any outstanding reservations too."""
+        """Zero both axes. Drops any outstanding reservations too.
+
+        Reservations created before the reset are invalidated: a later
+        commit() on one records its actual usage against the fresh window,
+        and a later release() is a harmless no-op. Either way the reserved
+        counters stay consistent.
+        """
         with self._lock:
             self._tokens = 0
             self._usd = 0.0
             self._tokens_reserved = 0
             self._usd_reserved = 0.0
+            self._generation += 1
 
     # ---- internal ----
 
@@ -193,12 +218,13 @@ class Reservation:
     committing to refund the reservation.
     """
 
-    __slots__ = ("_pool", "_tokens", "_usd", "_completed")
+    __slots__ = ("_pool", "_tokens", "_usd", "_generation", "_completed")
 
-    def __init__(self, _pool: BudgetPool, _tokens: int, _usd: float) -> None:
+    def __init__(self, _pool: BudgetPool, _tokens: int, _usd: float, _generation: int = 0) -> None:
         self._pool = _pool
         self._tokens = _tokens
         self._usd = _usd
+        self._generation = _generation
         self._completed = False
 
     def commit(self, *, tokens: int | None = None, usd: float | None = None) -> None:

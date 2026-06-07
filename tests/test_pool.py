@@ -168,6 +168,48 @@ def test_reset_zeroes_everything():
     assert snap.tokens_remaining == 100
 
 
+def test_commit_stale_reservation_after_reset_records_against_fresh_window():
+    # Regression: reset() drops the reserved counters; committing a reservation
+    # made before the reset must not double-subtract them (which used to drive
+    # tokens_reserved negative and corrupt tokens_remaining).
+    p = BudgetPool(token_cap=100)
+    r = p.try_reserve(tokens=40)
+    p.reset()
+    r.commit(tokens=40)
+    snap = p.snapshot()
+    assert snap.tokens_used == 40
+    assert snap.tokens_remaining == 60  # 100 - 40 used - 0 reserved
+
+
+def test_release_stale_reservation_after_reset_is_noop():
+    p = BudgetPool(token_cap=100)
+    r = p.try_reserve(tokens=40)
+    p.reset()
+    r.release()  # must not push tokens_reserved negative
+    snap = p.snapshot()
+    assert snap.tokens_used == 0
+    assert snap.tokens_remaining == 100
+
+
+def test_reserve_context_auto_release_after_reset_is_clean():
+    p = BudgetPool(token_cap=100)
+    with p.reserve(tokens=40):
+        p.reset()  # invalidates the live reservation mid-block
+    snap = p.snapshot()
+    assert snap.tokens_used == 0
+    assert snap.tokens_remaining == 100
+
+
+def test_stale_commit_still_respects_fresh_cap():
+    p = BudgetPool(token_cap=100)
+    r = p.try_reserve(tokens=40)
+    p.reset()
+    p.record(tokens=90)
+    with pytest.raises(BudgetExceeded):
+        r.commit(tokens=40)  # 90 + 40 = 130 > 100
+    assert p.snapshot().tokens_used == 90
+
+
 def test_snapshot_is_a_value_type():
     p = BudgetPool(token_cap=100)
     p.record(tokens=10)
