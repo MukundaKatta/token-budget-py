@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from token_budget import BudgetExceeded, BudgetPool, BudgetSnapshot
+from token_budget import BudgetExceeded, BudgetPool, BudgetSnapshot, Reservation
 
 # ---------- basic recording ----------
 
@@ -152,6 +152,59 @@ def test_commit_after_completion_raises():
     r.commit()
     with pytest.raises(RuntimeError):
         r.commit()
+
+
+def test_reservation_exposes_reserved_and_completed():
+    p = BudgetPool(token_cap=100, usd_cap=1.0)
+    r = p.try_reserve(tokens=30, usd=0.4)
+    assert isinstance(r, Reservation)
+    assert r.reserved_tokens == 30
+    assert r.reserved_usd == pytest.approx(0.4)
+    assert r.completed is False
+    r.commit()
+    assert r.completed is True
+
+
+def test_commit_less_than_reserved_refunds_difference():
+    p = BudgetPool(token_cap=100, usd_cap=1.0)
+    r = p.try_reserve(tokens=80, usd=0.8)
+    # actual usage came in lower than the hold; the slack must be freed.
+    r.commit(tokens=20, usd=0.1)
+    snap = p.snapshot()
+    assert snap.tokens_used == 20
+    assert snap.usd_used == pytest.approx(0.1)
+    assert snap.tokens_remaining == 80
+    assert snap.usd_remaining == pytest.approx(0.9)
+
+
+def test_try_reserve_raises_on_usd_axis():
+    p = BudgetPool(usd_cap=1.0)
+    p.record(usd=0.9)
+    with pytest.raises(BudgetExceeded) as exc:
+        p.try_reserve(usd=0.5)
+    assert exc.value.axis == "usd"
+    assert exc.value.cap == 1.0
+    assert exc.value.attempted == pytest.approx(1.4)
+    # the failed reservation left no hold behind
+    assert p.snapshot().usd_remaining == pytest.approx(0.1)
+
+
+def test_try_reserve_and_record_reject_negative():
+    p = BudgetPool()
+    with pytest.raises(ValueError):
+        p.try_reserve(tokens=-1)
+    with pytest.raises(ValueError):
+        p.try_reserve(usd=-0.5)
+
+
+def test_budget_exceeded_message_contains_axis_and_cap():
+    p = BudgetPool(token_cap=100)
+    with pytest.raises(BudgetExceeded) as exc:
+        p.record(tokens=150)
+    msg = str(exc.value)
+    assert "tokens" in msg
+    assert "150" in msg
+    assert "100" in msg
 
 
 # ---------- reset + snapshot ----------
